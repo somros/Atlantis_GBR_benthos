@@ -1,0 +1,216 @@
+---
+title: 'Scale sponge cover to the three functional groups: heterotrophic, phototrophic and bioeroding sponges'
+author: "Alberto Rovellini"
+date: "July 22, 2018"
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+---
+
+This document takes as input the geometry files to visualise which polygons are inner reef (coastal and runoff-impacted), lagoon and outer reefs. This is 
+
+```{r readData, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+library(maptools)
+library(ggmap)
+library(ggplot2)
+library(dplyr)
+library(stringr)
+library(reshape2)
+
+sh.reef <- readShapePoly("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/GBRfiles/eolreef.shp") # this is the contour of the reef on the GBR
+
+sh.boxes <- readShapePoly("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/bgm_gis/gbr_box_03012012.shp") # this is the model geometry
+
+box.data <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dataBoxes.csv")
+
+
+area.points <- fortify(sh.reef) # covert to a dataframe
+area.boxes <- fortify(sh.boxes)
+```
+
+```{r}
+
+# decide which boxes are coastal / inner reefs and which ones are outer reefs. Insert this manually
+
+coastal.boxes <- c(6,7,8,16,17,19,21,24,28,30,29,35,37,39,41,42,45,47,52,55,58,62,67,70,75,76,84,85,93,89,94,91,96,97,101,103,104,107)
+
+outer.boxes <- c(1,9,10,11,12,13,18,22,26,27,31,40,44,48,53,60,69,78,81,83,95,100,105,106)
+
+box.data$position <- rep("boundary", dim(box.data)[1])
+
+for (i in 1:dim(box.data)[1]) {
+  if (!box.data$is.boundary[i]) {
+    if (box.data$boxid[i] %in% coastal.boxes) {
+      box.data$position[i] <- "coastal"
+    } else if (box.data$boxid[i] %in% outer.boxes) {
+      box.data$position[i] <- "outer"
+    } else {
+      box.data$position[i] <- "middle"
+    }
+  }
+}
+
+# frac.reef column has NAs that have to be turned to 0s for the next step
+
+box.data$frac.reef[is.na(box.data$frac.reef)] <- 0
+
+# add a column that says if there is any fraction of reef in the box, if not no bioeroding sponge is allowed in that box
+
+box.data$has.reef <- rep(FALSE, dim(box.data)[1])
+
+for (i in 1:dim(box.data)[1]) {
+  if (box.data$frac.reef[i] > 0) {
+  box.data$has.reef[i] <- TRUE
+  }
+}
+
+# add boxType from file and compare
+
+box.type <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/boxType.csv")
+
+box.data$boxType <- box.type[,1]
+
+# need to join the box.data with the sh.box information to attach the boxtype and then plot it to check if we got the numbers right
+
+colnames(area.boxes)[6] <- "boxid"
+area.boxes$boxid <- as.numeric(area.boxes$boxid)
+df.both <- dplyr::left_join(area.boxes, box.data, by = "boxid")
+
+
+```
+
+
+```{r plotdata, eval=TRUE, fig.height = 12, fig.width=12}
+
+# NOTE: something during the attribution of the polygons mixed up box 1 and box 2. This should not be an issue but re-check thr calculaions.
+# Updat: calculations checked and it was in fact an issue. Should be fixed in the files now, not in the plot below yet.
+
+# Whole reef
+mapImage <- get_map(location = c(lon = 148, lat = -17.5),
+  color = "bw",
+  source = "google",
+  zoom = 5)
+
+ggmap(mapImage) +
+  geom_polygon(aes(x = long, y = lat, group = group, fill = position),
+    data = df.both,
+    color = "black",
+    alpha = 0.8) # +
+  # geom_polygon(aes(x = long, y = lat, group = group),
+  #   data = area.points,
+  #   color = "green",
+  #   fill = "green",
+  #   alpha = .1) +
+  # geom_point(data = df.AIMS, aes(x = LONGITUDE, y = LATITUDE),
+  #            color = "blue")
+  labs(x = "Longitude", y = "Latitude")
+```
+
+```{r}
+
+# write vector of 3 elements (fractions of SPH, SPP and SPE) per box. Rules: in coastal boxes and inner reefs, proportion is 0.6,0.2,0.2. In no-reef boxes it is 0.5,0.5. In outer-reef boxes it is 0.4,0.5,0.1. In mid-shelf boxes it is 0.45,0.45,0.1.
+
+multipliers <- vector(mode = "list", length = dim(box.data)[1])
+
+for (i in 1:dim(box.data)[1]) {
+  if (box.data$is.boundary[i]) {
+    multipliers[[i]] <- rep(0, 3)
+  } else if (!box.data$is.boundary[i]) {
+    if (!box.data$has.reef[i]) {
+      multipliers[[i]] <- c(0.5, 0.5, 0)
+    } else {
+      if (box.data$position[i] == "coastal") {
+        multipliers[[i]] <- c(0.6, 0.2, 0.2)
+      } else if (box.data$position[i] == "outer") {
+        multipliers[[i]] <- c(0.4, 0.5, 0.1)
+      } else {
+        multipliers[[i]] <- c(0.45, 0.45, 0.1)
+      }
+    }
+  }
+}
+
+mult.vectors <- data.frame(box.data$boxid, do.call("rbind", multipliers))
+
+names(mult.vectors) <- c("boxid", "het", "photo", "bioer")
+
+# read in the cover data from previous script
+
+cover.data <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/GRBCoverParamEstAIMS_and_SBP/estCoverAIMS_andSBP.csv")
+
+cover.split <- cover.data %>% mutate(
+  SpongeHeterotrophic = Sponges * mult.vectors$het,
+  SpongePhototrophic = Sponges * mult.vectors$photo,
+  SpongeBioeroding = Sponges * mult.vectors$bioer
+) %>% dplyr::select(
+  boxid:Seagrass, SpongeHeterotrophic:SpongeBioeroding, Reef:Mud
+)
+
+write.csv(cover.split, file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/GRBCoverParamEstAIMS_and_SBP/estCoverAIMS_andSBP_3sponges.csv", row.names = FALSE)
+
+```
+
+Plot sponge groups for report
+
+```{r}
+
+df.map <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/df_map.csv")
+
+# drop unwanted columns from box set
+
+df.box <- df.map %>% dplyr::select(
+  boxid:y
+)
+
+# drop unwanted columns from cover set
+
+cover.sponges <- cover.split %>% dplyr::select(
+  boxid, SpongeHeterotrophic:SpongeBioeroding
+)
+
+# number of times each row of the cover set needs to be replicated to match the box set
+
+n.times <- unlist(lapply(split(df.map, df.map$boxid), function(x) nrow(x)), use.names = F)
+
+stretched.sponges <- cover.sponges[rep(seq_len(nrow(cover.sponges)), n.times),] # strectch cover set
+
+# must turn to NA all the cover values in boundary boxes
+
+boundary.boxes <- c(0, 2, 20, 34, 43, 57, 66, 80, 102)
+
+stretched.sponges[stretched.sponges$boxid %in% boundary.boxes,] <- rep(NA, ncol(stretched.sponges))
+
+stretched.sponges <- stretched.sponges[,-1]
+
+# bind the two
+
+sponge.plot <- cbind(df.box, stretched.sponges)
+
+# melt for ggplot
+
+sponge.long <- melt(sponge.plot, id.vars = list("boxid", "x", "y"), variable.name = "Group", value.name = "Cover")
+
+```
+
+Plot
+
+```{r, fig.width = 12, fig.height = 5}
+
+sponge.cover <- ggplot(data = sponge.long, aes(x = x, y = y))+
+  geom_polygon(aes(fill = Cover, group = boxid), colour = "black", size = 0.25)+
+  scale_fill_gradient(low = "blue", high = "red", na.value = "white")+
+  labs(x = "Longitude", y = "Latitude", fill = "Proportional cover")+
+  theme_bw()+
+  facet_wrap(~ Group)
+
+ggsave("C:/Users/arove/Documents/Projects/Chapter3/textForThesis/pics/sponge_plot.pdf", sponge.cover, width = 12, height = 5, dpi = 600)
+
+```

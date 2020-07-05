@@ -1,0 +1,250 @@
+---
+title: "AIMS Benthic Monitoring: data manipulation"
+author: "Alberto Rovellini"
+date: "July 16, 2018"
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    toc: yes
+    toc_float: yes
+---
+
+This document reads the Long Term Benthic Monitoring data from AIMS and summarizes it for each sampling site. This data will be then interpolated with the previously analysed Seabed data. 
+The outputs of this documents are the csv files dfAIMS.csv and dfAIMS_years.csv, the latter of which will serve as input for the following scripts: "Analysis2_GBRCoverVisualisation" and "Analysis3_Shapefile_AIMS.Rmd".
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r message=FALSE, warning=FALSE}
+
+library(lubridate)
+library(ggplot2)
+library(reshape)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(data.table)
+library(ggforce)
+
+
+raw.data <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/AIMS_GBR_benthic_28-06.csv")
+
+# exploratory
+
+reefs <- levels(raw.data$REEF_NAME) # 93 reefs across the GBR
+sites <- levels(factor(raw.data$SITE_NO)) # 3 sites at each reef, it appears
+transects <- levels(factor(raw.data$TRANSECT_NO)) # 5 transects at each site
+raw.data$SAMPLE_DATE <- parse_date_time(as.character(raw.data$SAMPLE_DATE), "dmY HM", tz = "Australia/Brisbane")
+raw.data$YEAR <- year(raw.data$SAMPLE_DATE)
+years <- levels(factor(year(raw.data$SAMPLE_DATE))) # years from 1992-2018
+months <- levels(factor(month(raw.data$SAMPLE_DATE))) # all months covered, but likely not for each reef
+
+# first, need to re-cast this frame to wide format, easier to manipulate
+
+cast.AIMS <- dcast(raw.data, REEF_NAME + FULLREEF_ID + SITE_LAT + SITE_LONG + SITE_NO + TRANSECT_NO + SAMPLE_DATE + 
+                     YEAR ~ BENTHOS_DESC, value.var = "COVER")
+glimpse(cast.AIMS)
+
+```
+
+# Assumptions 1 & 2
+
+The calculation of substrate type below requires two assumptions: 
+
+1. No mud is present on shallow coral reefs, reef and sand are the only habitats. This is backed up by previous seabed data analysis and is ecologically reasonable.
+
+2. All biotic groups and all rock and rubble sit on coral reef, or compose it. Sand is the only category that is on... sand (i.e. flat in Atlantis). That is, none of the occurrences of biotic groups were recorded on sand in the AIMS data. This relies on the way AIMS does benthic surveys (that is the way Opwall implemented too). The target of their moitoring is coral reef, and large sand patches would be avoided. As to the statement "no biotic group is on sand" this is essentially true for most of the recorded groups except sponges, at shallow depth. And even then, given the way the transects are done, there should not be many instances of sponges (or anything else) that is recorded and sits in the middle of a sandy habitat. For methods used by AIMS for their long-term monitoring, see https://www.aims.gov.au/docs/research/monitoring/reef/sampling-methods.html.
+
+Following these two assumptions, the proportion of flat habitat is the sand cover, the proportion of reef habitat is the sum of all biotic and hard bottom covariates.
+
+```{r}
+
+df.cover <- cast.AIMS %>%
+  mutate(
+    Flat = Sand, 
+    Reef = rowSums(.[c(9:30, 32:length(cast.AIMS))]),
+    TotalHabitat = Flat + Reef
+  )
+
+# There are some mistakes in the data. In some transects, % cover is way above 100 (max 175%). Eliminate those that have % > 110,
+# it's about 0.2% of the original dataset. Minor mistakes will be reabsorbed in averaging
+
+length(which(df.cover$TotalHabitat > 110)) / dim(df.cover)[1]
+
+df.cover <- df.cover[-which(df.cover$TotalHabitat > 110),]
+df.cover <- df.cover[-which(df.cover$TotalHabitat < 90),]
+
+# need to eliminate spaces and illegal characters from column names
+
+names(df.cover) <- gsub(" ", "", names(df.cover), fixed = TRUE)
+names(df.cover) <- gsub("-", "", names(df.cover), fixed = TRUE) 
+names(df.cover) <- gsub("&", "and", names(df.cover), fixed = TRUE)
+names(df.cover) <- gsub("Macroalgae", "Macroalga", names(df.cover), fixed = TRUE) # for some reason it will drop the column if the name is the same in mutate
+
+# map AIMS benthic types to Atlantis Benthic types
+
+df.GBR <- df.cover %>%
+  mutate(
+    AlgaeCC = Corallinealgae,
+    AlgaeTurf = Turfalgae,
+    CoralBrain = MassivenonAcropora + Mushroomcoral + Solitarycoral + SubmassiveAcropora + SubmassivenonAcropora,
+    CoralBranch = BottlebrushAcropora + BranchingAcropora + BranchingnonAcropora + DigitateAcropora + TabulateAcropora +  Millepora,
+    CoralSheet = EncrustingAcropora + EncrustingnonAcropora + FoliosenonAcropora,
+    CoralSoft = Zoanthid + ArbandEncSoftCoral + ArborescentSoftCoral + CapitateSoftCoral + EncrustingSoftCoral + LobateSoftCoral + MassiveSoftCoral + Softcoral,
+    Macroalgae = Macroalga,
+    Reef = Reef,
+    Flat = Flat,
+    Sponges = Sponge,
+    Other = Otherorganisms + Unknown # leave these out as not in any GBR group yet nor can be placed unless we have a generic "Other" functional group"
+  ) 
+
+df.short <- df.GBR %>%
+  dplyr::select(REEF_NAME:YEAR, AlgaeCC:Sponges, Flat:TotalHabitat)
+
+# aggregate by reef, site, year. Get a mean per each site across n transects, nested by year
+
+df.sites <- df.short %>% 
+  group_by(REEF_NAME, SITE_NO, YEAR) %>%
+  summarise(
+    LATITUDE = mean(SITE_LAT),
+    LONGITUDE = mean(SITE_LONG),
+    n = n(),
+    mean.AlgaeCC = mean(AlgaeCC),
+    mean.AlgaeTurf = mean(AlgaeTurf),
+    mean.CoralBrain = mean(CoralBrain),
+    mean.CoralBranch = mean(CoralBranch),
+    mean.CoralSheet = mean(CoralSheet),
+    mean.CoralSoft = mean(CoralSoft),
+    mean.Macroalgae = mean(Macroalgae),
+    mean.Sponges = mean(Sponges),
+    mean.Flat = mean(Flat),
+    mean.Reef = mean(Reef),
+    mean.TotalHabitat = mean(TotalHabitat)
+  ) %>%
+  mutate(
+    mean.Live = mean.AlgaeCC + mean.AlgaeTurf + mean.CoralBrain + mean.CoralBranch + mean.CoralSheet + mean.CoralSoft + mean.Macroalgae + mean.Sponges,
+    mean.HardCoral =  mean.CoralBrain + mean.CoralBranch + mean.CoralSheet
+  ) 
+
+# change names to drop .mean
+
+names(df.sites) <- gsub("mean.", "", names(df.sites), fixed = TRUE)
+
+# reorder the columns
+
+df.sites <- df.sites %>%
+  dplyr::select(REEF_NAME:Sponges, HardCoral, Live, Flat:TotalHabitat)
+
+# turn % covers to proportion covers to total
+
+for (i in 7:dim(df.sites)[2]) {
+  df.sites[,i] <- df.sites[,i]/df.sites$TotalHabitat
+}
+
+glimpse(df.sites)
+
+```
+The above treats replicate sites within a reef as separate data points to be carried over to the next bit of analysis. While the averaging will be done later anyway, this is the attempt to carry over the small-scale spatial variation, that can be large even between replicate sites separated by a few hundreds of meters. This will be lost later with pooling sites by Atlantis box, but we keep it for now.
+
+```{r}
+write.csv(df.sites, file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dfAIMS.csv", row.names = FALSE)
+
+# For use of the output we need to pick only 2005 and 2006
+
+my.years <- 2005:2006
+df.sites.years <- df.sites[df.sites$YEAR %in% my.years,]
+
+write.csv(df.sites.years, file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dfAIMS_years.csv", row.names = FALSE)
+
+# note: for sites sampled twice in the same year, i.e. n = 10, we pool the 10 together assuming that in 1 year the site has not changed too much. this assumption may be wrong but it is needed unless we rely on months too, which is an issue if later on we need to find annual values anyway previous solution was to drop the second sampling event of each year, but this method still scales down to 100% as it calculates the average across whichever many transects we have
+```
+
+
+## Plotting region 
+
+Go to reef level, i.e. average across sites for each reef.
+
+```{r}
+
+# aggregate the 3 sites for each reef
+
+df.reefs <- df.sites %>% group_by(REEF_NAME, YEAR) %>% 
+  summarise(
+    LATITUDE = mean(LATITUDE),
+    LONGITUDE = mean(LONGITUDE),
+    n = n(),
+    mean.AlgaeCC = mean(AlgaeCC),
+    mean.AlgaeTurf = mean(AlgaeTurf),
+    mean.CoralBrain = mean(CoralBrain),
+    mean.CoralBranch = mean(CoralBranch),
+    mean.CoralSheet = mean(CoralSheet),
+    mean.CoralSoft = mean(CoralSoft),
+    mean.Macroalgae = mean(Macroalgae),
+    mean.Sponges = mean(Sponges),
+    mean.Flat = mean(Flat),
+    mean.Reef = mean(Reef),
+    mean.TotalHabitat = mean(TotalHabitat),
+    SE.sponges = sd(Sponges)/sqrt(length(Sponges))
+  ) %>%
+  mutate(
+    mean.Live = mean.AlgaeCC + mean.AlgaeTurf + mean.CoralBrain + mean.CoralBranch + mean.CoralSheet + mean.CoralSoft + mean.Macroalgae + mean.Sponges,
+    mean.HardCoral =  mean.CoralBrain + mean.CoralBranch + mean.CoralSheet
+  ) 
+
+# change names to drop mean.
+
+names(df.reefs) <- gsub("mean.", "", names(df.reefs), fixed = TRUE)
+
+# reorder the columns
+
+df.reefs <- df.reefs %>%
+  dplyr::select(REEF_NAME:Sponges, HardCoral, Live, Flat:SE.sponges)
+
+# rearrange for ggplot
+
+df.plot <- tidyr::gather(df.reefs, key = "Group", 
+  value = "Cover", AlgaeCC:SE.sponges) 
+
+```
+
+```{r fig.width=12, fig.height=50,}
+
+df.plot <- df.plot %>% filter(Group == "Sponges" | Group == "SE.sponges")
+
+# must manage to order from N to S
+
+n_pages <- ceiling(length(levels(droplevels(df.plot$REEF_NAME))) / 20)
+
+for (i in seq_len(n_pages)) {
+
+  p <- ggplot(data = df.plot[df.plot$Group == "Sponges",], aes(x = YEAR, y = Cover, group = Group))+
+    geom_point(aes(color = Group))+
+    scale_color_manual(values = "firebrick")+
+    geom_errorbar(ymax = df.plot[df.plot$Group == "Sponges",]$Cover + df.plot[df.plot$Group == "SE.sponges",]$Cover,
+                  ymin = df.plot[df.plot$Group == "Sponges",]$Cover - df.plot[df.plot$Group == "SE.sponges",]$Cover,
+                  color = "firebrick")+
+    geom_line(aes(color = Group))+
+     scale_x_continuous(breaks = seq(1994, 2016, 4),
+                     labels = seq(1994, 2016, 4),
+                     limits = c(1993, 2017))+
+    theme_bw()+
+    theme(
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor.y = element_blank())+
+    theme(axis.text.x=element_text(size=10, angle = 45, 
+                                 hjust = 1, vjust = .9))+
+    facet_wrap_paginate(~ REEF_NAME, ncol = 4, nrow = 5, page = i)
+  ggsave(paste("C:/Users/arove/Documents/Projects/Chapter3/R_scripts/interpolationAIMS/pics/", i, "spongesGBR.png", sep = ""),
+         p, width = 8, height = 11)
+  
+}
+
+```
+
+Sponges appear to be present in very low cover, mostly stable. A few reefs used to have high % cover of sponges (by high we mean 10%), but it crashed around 2010.

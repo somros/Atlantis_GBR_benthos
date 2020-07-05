@@ -1,0 +1,433 @@
+---
+title: 'Reef analysis: shape file manipulation'
+author: "Alberto Rovellini (on Shane Richards' script)"
+date: "July 18, 2018"
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+---
+
+# Read in data 
+
+This document takes shapefile data of the Great Barrier Reef on box location and reef location, and estimates the fraction of reef in each box. This document reads in two benthic cover dataset: one for inter-reefal seabed habitat (Seabed Biodiversity Project, SBP), and one of coral reef benthic monitoring (AIMS long term monitoring).
+Output of this document are: dataBoxes.csv, containing information of area, number of sites, number of reef sites etc for each box in the model domain; and dataAIms.csv, an expansion of the previously extracted dataset of the AIMS data. Both will be used as inputs in the following script "Analysis4_Cover_AIMS.Rmd". 
+
+# Plot the reef system
+
+```{r readData, message=FALSE, warning=FALSE}
+rm(list = ls())
+
+library(maptools)
+library(ggmap)
+library(ggplot2)
+
+sh.reef <- readShapePoly("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/GBRfiles/eolreef.shp") # this is the contour of the reef on the GBR
+
+sh.boxes <- readShapePoly("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/bgm_gis/gbr_box_03012012.shp") # this is the model geometry
+
+sh.samples <- readShapePoints("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/bgm_gis/tappity.shp") # this is a shapefile equal to the SBP csv datasheet
+
+df.AIMS <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dfAIMS_years.csv") # this is the AIMS data
+
+area.points <- fortify(sh.reef) # covert to a dataframe
+area.boxes <- fortify(sh.boxes)
+```
+
+```{r plotdata, eval=TRUE, fig.height = 12, fig.width=12}
+# Whole reef
+mapImage <- get_map(location = c(lon = 148, lat = -17.5),
+  color = "bw",
+  source = "google",
+  zoom = 5)
+
+ggmap(mapImage) +
+  geom_polygon(aes(x = long, y = lat, group = group),
+    data = area.boxes,
+    color = "darkred",
+    fill = "red",
+    alpha = 0.1) +
+  geom_polygon(aes(x = long, y = lat, group = group),
+    data = area.points,
+    color = "green",
+    fill = "green",
+    alpha = .2) +
+  geom_point(data = df.AIMS, aes(x = LONGITUDE, y = LATITUDE),
+             color = "blue")
+  labs(x = "Longitude", y = "Latitude")
+```
+
+Calculate the proportion of reef in each box.
+
+```{r processData, eval=TRUE, message=FALSE, warning=FALSE}
+library(sp)
+library(raster)
+library(rgdal)
+library(rgeos)
+library(dplyr)
+library(stringr)
+library(mgcv)
+
+# read in the reef data from a shape file 
+sh.reef   <- raster::shapefile("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/GBRfiles/eolreef.shp")
+reef.ID   <- sh.reef$ID # store relevant data: reef ID
+reef.area <- sh.reef$AREA    # store reef area
+sh.reef   <- as(sh.reef, 'SpatialPolygons') # remove attribute data
+
+# read in the box geometry data from shape file 
+sh.box    <- raster::shapefile("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/gbr_box_03012012.shp")
+box.depth <- -sh.box$BOTZ   # store relevant data: box depth
+box.ID    <- sh.box$BOX_ID  # store boxid
+sh.box    <- as(sh.box, 'SpatialPolygons') # remove attribute data
+
+# create spatial data frames with the desired attributes
+box.df  <- SpatialPolygonsDataFrame(sh.box, 
+  data.frame(boxid=box.ID, depth = box.depth), 
+  match.ID=F)
+reef.df <- SpatialPolygonsDataFrame(sh.reef, 
+  data.frame(reefid=reef.ID, area = reef.area),
+  match.ID=F)
+projection(reef.df) <- projection(box.df) # make sure prejections are same
+
+# create the reef/box intersection spatial dataframe
+reefbox.df <- gIntersection(box.df, reef.df, byid = TRUE) # something here drops some polygons!!!
+
+nms <- names(reefbox.df) # extract the intersection names of the reefs 
+nms <- data.frame(t(data.frame(strsplit(nms, " ", fixed = TRUE)))) # split text
+colnames(nms)[1:2] <- c("box.reefbox","reef.reefbox") # use intersection names
+nms$area <- sapply(reefbox.df@polygons, function(x) x@area) # intersection area
+nms$box.reefbox <- as.character(nms$box.reefbox)
+
+boxarea <- sapply(sh.box@polygons, function(x) x@area) # box areas
+boxnew.df  <- data.frame(box.reefbox = row.names(sh.box), total.area = boxarea,
+  stringsAsFactors= FALSE) # create
+
+df.both <- dplyr::left_join(nms, boxnew.df, by = "box.reefbox")
+
+df.summary <- df.both %>%
+  group_by(box.reefbox) %>% 
+  dplyr::summarise(reef.area = sum(area), total.area = mean(total.area)) %>%
+  mutate(frac.reef = reef.area/total.area, boxid = as.integer(box.reefbox)) %>%
+  arrange(boxid)
+
+df.summary <- dplyr::select(df.summary, boxid, total.area, reef.area, frac.reef)
+
+glimpse(df.summary)
+
+make.map.object <- function(bgm.file, cum.depth){
+  bgm <- readLines(bgm.file) # read in the geometry file
+  
+  numboxes <- 0
+  j <- grep(pattern = "nbox", x = bgm, value = FALSE) # file row(s)
+  if (length(j) > 0) { # found rows with nbox
+    jnew <- NULL
+    for (jj in 1:length(j)) {
+      # Valid row is when tmplt is the first entry and second is a number
+      text.split <- unlist(str_split(
+        gsub(pattern = "[\t ]+", x = bgm[j[jj]], replacement = " "), " "))
+      if (text.split[1] == "nbox") {
+        jnew <- c(jnew,j[jj]) # add the row that satisfies the criteria
+      }
+    }
+    j <- jnew # use this list of rows as they are valid
+    if (length(j) == 1) { # a single row is found
+      text.split <- unlist(str_split(
+        gsub(pattern = "[\t ]+", x = bgm[j], replacement = " "), " "))
+      numboxes <- as.numeric(text.split[2])
+    }
+  }  
+  
+  # Extract the box vertices
+  map.vertices <- data.frame()
+  for(i in 1:numboxes){
+    txt.find <- paste("box", i - 1, ".vert", sep = "")
+    j <- grep(txt.find, bgm)
+    for (jj in 1:length(j)) {
+      text.split <- unlist(str_split(
+        gsub(pattern = "[\t ]+", x = bgm[j[jj]], replacement = " "), " "))
+      if (text.split[1] == txt.find) {
+        map.vertices <- rbind(map.vertices, cbind(i - 1, as.numeric(text.split[2]),
+          as.numeric(text.split[3])))
+      } 
+    }
+  }  
+  names(map.vertices) <- c("boxid", "x", "y")  
+  
+  # find the depths and areas, and identify island boxes
+  box.indices <- rep(0, numboxes)  
+  for(i in 1:numboxes){ # box depth
+    box.indices[i] <- grep(paste("box", i - 1, ".botz", sep = ""), bgm)
+  }
+  z.tmp <- strsplit(bgm[box.indices], "\t")
+  z <- as.numeric(sapply(z.tmp,`[`,2))
+  box.data <- data.frame(boxid = 0:(numboxes-1), z = z)
+  box.data <- mutate(box.data, is.island = (z >= 0.0))
+  for(i in 1:numboxes){ # box area
+    box.indices[i] <- grep(paste("box", i - 1, ".area", sep = ""), bgm)
+  }
+  a.tmp <- strsplit(bgm[box.indices], "\t")
+  a <- as.numeric(sapply(a.tmp,`[`,2))
+  box.data$area <- a
+  box.data <- mutate(box.data, volume = -z*area)
+  
+  # read in the internal coordinates from bgm file
+  box.indices <- rep(0, numboxes)  
+  x.in <- rep(0, numboxes)
+  y.in <- rep(0, numboxes)
+  for(i in 1:numboxes){
+    j <- grep(paste("box", i - 1, ".inside", sep = ""), bgm)
+    text.split <- unlist(str_split(
+      gsub(pattern = "[\t ]+", x = bgm[j], replacement = " "), " "))
+    x.in[i] <- as.numeric(text.split[2])
+    y.in[i] <- as.numeric(text.split[3])
+  }
+  box.data$x.in <- x.in # add internal y-location
+  box.data$y.in <- y.in # add internal y-location
+  box.data$boxid <- factor(box.data$boxid) # make boxid a factor
+  
+  # calculate the number of water layers per box base don cumulative depths
+  # CHECK THIS IS CORRECT: boxid = 21, index = 21 (6 but should be 5)
+  z <- -box.data$z # convert depths so depth below surface is positive
+  z <- pmax(0,z) # remove depths above the surface 
+  z <- pmin(z, max(cum.depth)) # don't alow depth to be greater than max depth
+  box.numlayers <- rep(0, length(z)) # vector containing number of water layers
+  for (i in 1: length(z)) {
+    box.numlayers[i] <- sum(z[i] > cum.depth)
+  }
+  box.data$numlayers <- box.numlayers # add the vector to box.data
+  
+  return(list(
+    map.vertices = map.vertices, 
+    box.data     = box.data)
+  )
+}
+
+bgm.file <- "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/GBRShapefiles/gbr_geo_03012012.bgm" # lat-long values
+cum.depth <- c(0,5,10,20,50,100,200,2527) # cumulative water layer depths
+map.object <- make.map.object(bgm.file, cum.depth) 
+
+map.vertices <- map.object$map.vertices
+box.data <- map.object$box.data
+box.data$boxid <- as.integer(as.character(box.data$boxid))
+glimpse(box.data)
+box.data <- dplyr::left_join(box.data, df.summary, by = "boxid")
+boundary.boxes <- c(0,2,20,34,43,57,66,80,102) # ignore cover in boundary boxes
+
+### WARNING ### 
+
+# applying correction to box.data here, because boxes 1 and 2 got swapped. I suspect this to be a bug in QGIS as it happens while exporting the layer. Columns between boxid:numlayers are correct. Columns total.area:frac.reef must be swapped (notice the values of "area" and "total.area" for boxes 1 and 2). This is particularly important since box 1 is a reef box and box 2 is a deep oceanic boundary box
+
+box2 <- box.data[2, c(9:11)]
+box1 <- box.data[3, c(9:11)]
+
+box.data[2, c(9:11)] <- box1
+box.data[3, c(9:11)] <- box2
+
+
+box.data$frac.reef[boundary.boxes+1] <- 0.0 # ignore cover in boundary boxes
+
+### here we have to reintroduce the area of the boxes that have no overlapping with reefs, as that went lost. Put reef area as 0 and proportion as 0. Namely, boxes 55, 92, 100 and 107 have no area, manually add it.
+
+non.reef.boxes <- c(55, 92, 100, 107)
+box.data$reef.area[non.reef.boxes+1] <- 0.0
+box.data$frac.reef[non.reef.boxes+1] <- 0.0
+box.data$total.area[non.reef.boxes+1] <- box.data$area[non.reef.boxes+1]
+
+# 
+
+
+############
+
+df.map <- left_join(map.vertices, 
+  dplyr::select(box.data, boxid, total.area:frac.reef), 
+  by = "boxid")
+df.map$frac.reef[is.na(df.map$frac.reef)] <- 0
+
+write.csv(df.map, "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/df_map.csv", row.names = F, col.names = F) #write this out to be used elsewhere if need polygons
+
+# plot the fraction of reef in each box
+ggplot(data = df.map, aes(x = x, y = y)) +
+  geom_polygon(
+    aes(fill = frac.reef, group = boxid), 
+    color = "black", size = 0.25) +
+  scale_fill_gradient(low="white", high="forestgreen", na.value = "red") +
+  scale_x_continuous(breaks=c(140,143,146,149,152,155)) + 
+  labs(fill = "Fraction\nreef") +
+  xlab("Longitude") + ylab("Latitude") +
+  ggplot2::theme_bw()
+```
+
+Combine benthic survey data with reef distribution shape files.
+
+Use box specific non-reef site data for non-reef fraction. Bring together Seabed data and AIMS data for this purpose. This will be used later to calculate percentage cover scaled to habitat cover, to be included in the initial conditionos files
+
+```{r}
+
+# resolve AIMS data first
+
+reefs <- dim(reef.df)[1]    # number of reefs
+sites.AIMS <- dim(df.AIMS)[1] # number of sites
+site.locs.AIMS <- matrix(data = c(df.AIMS$LONGITUDE, df.AIMS$LATITUDE), 
+  ncol = 2)
+on.reef.AIMS <- rep(FALSE, sites.AIMS)
+for (i in 1:reefs) { # this places the sites on reef according to shapefile of reefs
+  # boundary points of the reef
+  bnd <- matrix(data = sh.reef@polygons[[i]]@Polygons[[1]]@coords, ncol = 2)
+  on.reef.AIMS <- on.reef.AIMS | in.out(bnd,site.locs.AIMS)
+}
+
+frac.on.reef.AIMS <- sum(on.reef.AIMS)/sites.AIMS
+
+```
+
+# Assumption 3
+
+Only 31% of the AIMS data is "on reef" according to the intersection of their coordinates with the shapefile, compared to 2% of the seabed data. However, I think that what is happening here is that coordinates drop a reef site just outside the reef area of the shapefile, as most sit along the edge of it (wall reefs). AIMS targets reef specifically with their monitoring, therefore it is unreasonable to think that only 1 in 3 sites is actually coral reef. Because of this, all AIMS sites will be deemed on.reef == TRUE. Keep in mind that this is coming to terms with Atlantis' concept of habitats, rather than an ecological violation.
+
+
+```{r, fig.width = 7.5, fig.height = 9}
+
+on.reef.AIMS[!isTRUE(on.reef.AIMS)] <- TRUE
+
+# carry on with the script
+
+df.sampled.AIMS <- data.frame(x = df.AIMS$LONGITUDE, y = df.AIMS$LATITUDE, on.reef = on.reef.AIMS)
+
+# resolve for seabed data
+
+sites <- dim(sh.samples)[1] # number of sites
+site.locs <- matrix(data = c(sh.samples$LONGITUDE, sh.samples$LATITUDE), 
+  ncol = 2)
+on.reef <- rep(FALSE, sites)
+for (i in 1:reefs) { # this places the sites on reef according to shapefile of reefs
+  # boundary points of the reef
+  bnd <- matrix(data = sh.reef@polygons[[i]]@Polygons[[1]]@coords, ncol = 2)
+  on.reef <- on.reef | in.out(bnd,site.locs)
+}
+
+frac.on.reef <- sum(on.reef)/sites
+
+df.sampled <- data.frame(x = sh.samples$LONGITUDE, y = sh.samples$LATITUDE, on.reef)
+
+# all samples
+
+all.samples <- rbind(df.sampled.AIMS, df.sampled)
+
+# plot the distribution of reef sites throughout the GBR
+# add to the plot the new AIMS data, assumed to be all on reef
+
+ggplot(data = all.samples, aes(x = x, y = y, color = on.reef))+
+  geom_polygon(data = df.map,
+    aes(x = x, y = y, group = boxid), colour = "grey10", fill = NA, size = 0.25)+
+  geom_point(size = 1.0, alpha = 0.6) +
+  scale_color_manual(values = c("deepskyblue", "firebrick"))+
+  scale_x_continuous(breaks=c(140,143,146,149,152,155)) + 
+  labs(fill = "On reef") +
+  xlab("Longitude") + ylab("Latitude") +
+  theme_bw()
+
+# now need to add boxid to AIMS data
+
+head(df.AIMS)
+numboxes <- dim(box.data)[1]
+
+for (i in 0:(numboxes-1)) {
+  tmp <- filter(map.vertices, boxid == i)
+  bnd <- matrix(data = c(tmp$x, tmp$y), ncol = 2)
+  sites <- matrix(data = c(df.AIMS$LONGITUDE, df.AIMS$LATITUDE), ncol = 2)
+  df.AIMS$boxid[in.out(bnd,sites)] <- i
+}
+
+df.AIMS$on.reef <- on.reef.AIMS
+
+# need to update box data with the new AIMS data. This will be used later in calculating the proportions of habitats and cover per box
+
+# write data frame containing site survey information (incl. on reef) and boxid
+write.csv(df.AIMS, file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dataAIMS.csv", row.names=FALSE)
+
+
+```
+
+Plot model domain with depths.
+
+
+
+
+```{r onReef, eval=TRUE}
+
+# calculate the total number of sites in each box. This includes now both AIMS and SBP
+
+# read in SBP data 
+
+df.SBP <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/Benthic/dataSites.csv", stringsAsFactors = FALSE)
+
+df.SiteNums.AIMS <- df.AIMS %>% group_by(boxid) %>%
+  dplyr::summarise(n = n()) # calculate the number of reef sites in each box for AIMS
+df.SiteNums.SBP <- df.SBP %>% group_by(boxid) %>%
+  dplyr::summarise(n = n()) # calculate the number of reef sites in each box for SBP
+# concatenate and group again
+df.SiteNums <- rbind(df.SiteNums.AIMS, df.SiteNums.SBP) %>% group_by(boxid) %>%
+  dplyr::summarise(n = sum(n)) # this is for both datasets
+
+# add number of sites to the box dataframe
+
+box.data <- box.data %>% mutate(sites = 0)
+for (i in 1:length(df.SiteNums$boxid)) {
+  box.data$sites[df.SiteNums$boxid+1] <- df.SiteNums$n
+}
+
+
+# calculate the number of reef sites in each box
+df.SiteNums.AIMS.reef <- df.AIMS %>% filter(on.reef == TRUE) %>% group_by(boxid) %>%
+  dplyr::summarise(n = n()) 
+df.SiteNums.SBP.reef <- df.SBP %>% filter(on.reef == TRUE) %>% group_by(boxid) %>%
+  dplyr::summarise(n = n())
+# concatenate and group again
+df.SiteNums.reef <- rbind(df.SiteNums.AIMS.reef, df.SiteNums.SBP.reef) %>% group_by(boxid) %>%
+  dplyr::summarise(n = sum(n)) # this is for both datasets
+
+# add number of reef sites to the box dataframe
+
+box.data <- box.data %>% mutate(sites.reef = 0)
+for (i in 1:length(df.SiteNums.reef$boxid)) {
+  box.data$sites.reef[df.SiteNums.reef$boxid+1] <- df.SiteNums.reef$n
+}
+
+boundary.boxes <- c(0,2,20,34,43,57,66,80,102) # ignore cover in boundary boxes
+box.data$is.boundary <- rep(FALSE, dim(box.data)[1])
+for (i in boundary.boxes) {
+  box.data$is.boundary[i+1] <- TRUE
+}
+
+# add is.interior column (opposite of boundary)
+
+box.data$is.interior <- rep(FALSE, dim(box.data)[1])
+
+for (i in 1:dim(box.data)[1]) {
+  if (box.data$is.boundary[i] == FALSE) {
+  box.data$is.interior[i] <- TRUE
+  }
+}
+
+# we need one more column: boxid.ref. I cannot locate where in the original scripts this was calculated and how, but boxid.ref indicates for each model box which box should be used for resampling. Boxes for which there is data are not used for resampling, i.e. their boxid.ref value is themselves. NOte that this applies only to the SBP data. AIMS data will be dealt with differently, because data is so sparse we will use the three N-M-S vectors
+
+boxid.ref <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/boxidref.csv") # this column was copied from a boxid csv file that included this column, although I cannot seem to find how these were attributed
+
+box.data$boxid.ref <- boxid.ref[,1]
+
+
+
+# write data frame containing site survey information (incl. on reef) and boxid that captures informations for both datasets
+
+# df.ReefType <- read.csv(file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/init/boxTypes.csv", header = TRUE, stringsAsFactors = FALSE)
+# box.data$boxType <- df.ReefType$boxType
+
+# write data frame containing box data and fraction reef
+write.csv(box.data, file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dataBoxes.csv", row.names=FALSE)
+
+```

@@ -1,0 +1,330 @@
+---
+title: 'Species distribution of benthic types on the GBR: AIMS long term benthic monitoring data'
+author: "Alberto Rovellini (on Shane Richards' script)"
+date: "11 July 2018"
+output:
+  html_document:
+    code_folding: hide
+    fig_caption: yes
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+---
+
+# Summary
+
+This document investigates the habitat cover data provided for the Great Barrier Reef (GBR). Data is the AIMS long term benthic monitoring data. Data from 2005-2006 are used, as closest to Seabed Biodiversity Project data used for previous analysis. This script requires as input the file dfAIMS_years.csv, output of "Analysis1_AIMS_Benthic_Analysis.Rmd".
+
+# Empirical Data
+
+## Sites
+
+```{r message=FALSE}
+rm(list = ls())
+
+# library(mgcv)
+library(dplyr)
+library(stringr)
+library(mgcv)
+library(knitr)
+library(ggtern)
+library(ggplot2)
+library(reshape2)
+
+# read in AIMS data
+
+df.AIMS <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dfAIMS_years.csv")
+
+```
+
+In total, `r length(levels(factor(df.AIMS$REEF_NAME)))` reefs were surveyed, located between latitudes:
+`r min(df.AIMS$SITE_LAT)` and `r max(df.AIMS$SITE_LAT)`. Each reef was surveyed in three replicate sites. Site locations relative to the Atlantis box locations are presented below. Sampling sites are absent from some of the Atlantis boxes, especially at the northern end of the model domain.
+
+
+```{r eval=TRUE, fig.width = 8, fig.height = 10}
+# +==========================================================+
+# |  make.map.object.frc : collect data for displaying maps  |
+# +==========================================================+
+make.map.object.frc <- function(bgm.file, cum.depth){
+  bgm <- readLines(bgm.file) # read in the geometry file
+  
+  numboxes <- 0
+  j <- grep(pattern = "nbox", x = bgm, value = FALSE) # file row(s)
+  if (length(j) > 0) { # found rows with nbox
+    jnew <- NULL
+    for (jj in 1:length(j)) {
+      # Valid row is when tmplt is the first entry and second is a number
+      text.split <- unlist(str_split(
+        gsub(pattern = "[\t ]+", x = bgm[j[jj]], replacement = " "), " "))
+      if (text.split[1] == "nbox") {
+        jnew <- c(jnew,j[jj]) # add the row that satisfies the criteria
+      }
+    }
+    j <- jnew # use this list of rows as they are valid
+    if (length(j) == 1) { # a single row is found
+      text.split <- unlist(str_split(
+        gsub(pattern = "[\t ]+", x = bgm[j], replacement = " "), " "))
+      numboxes <- as.numeric(text.split[2])
+    }
+  }  
+  
+  # Extract the box vertices
+  map.vertices <- data.frame()
+  for(i in 1:numboxes){
+    txt.find <- paste("box", i - 1, ".vert", sep = "")
+    j <- grep(txt.find, bgm)
+    for (jj in 1:length(j)) {
+      text.split <- unlist(str_split(
+        gsub(pattern = "[\t ]+", x = bgm[j[jj]], replacement = " "), " "))
+      if (text.split[1] == txt.find) {
+        map.vertices <- rbind(map.vertices, cbind(i - 1, as.numeric(text.split[2]),
+          as.numeric(text.split[3])))
+      } 
+    }
+  }  
+  names(map.vertices) <- c("boxid", "x", "y")  
+  
+  # find the depths and areas, and identify island boxes
+  box.indices <- rep(0, numboxes)  
+  for(i in 1:numboxes){ # box depth
+    box.indices[i] <- grep(paste("box", i - 1, ".botz", sep = ""), bgm)
+  }
+  z.tmp <- strsplit(bgm[box.indices], "\t")
+  z <- as.numeric(sapply(z.tmp,`[`,2))
+  box.data <- data.frame(boxid = 0:(numboxes-1), z = z)
+  box.data <- mutate(box.data, is.island = (z >= 0.0))
+  for(i in 1:numboxes){ # box area
+    box.indices[i] <- grep(paste("box", i - 1, ".area", sep = ""), bgm)
+  }
+  a.tmp <- strsplit(bgm[box.indices], "\t")
+  a <- as.numeric(sapply(a.tmp,`[`,2))
+  box.data$area <- a
+  box.data <- mutate(box.data, volume = -z*area)
+  
+  # read in the internal coordinates from bgm file
+  box.indices <- rep(0, numboxes)  
+  x.in <- rep(0, numboxes)
+  y.in <- rep(0, numboxes)
+  for(i in 1:numboxes){
+    j <- grep(paste("box", i - 1, ".inside", sep = ""), bgm)
+    text.split <- unlist(str_split(
+      gsub(pattern = "[\t ]+", x = bgm[j], replacement = " "), " "))
+    x.in[i] <- as.numeric(text.split[2])
+    y.in[i] <- as.numeric(text.split[3])
+  }
+  box.data$x.in <- x.in # add internal y-location
+  box.data$y.in <- y.in # add internal y-location
+  box.data$boxid <- factor(box.data$boxid) # make boxid a factor
+  
+  # calculate the number of water layers per box base don cumulative depths
+  # CHECK THIS IS CORRECT: boxid = 21, index = 21 (6 but should be 5)
+  z <- -box.data$z # convert depths so depth below surface is positive
+  z <- pmax(0,z) # remove depths above the surface 
+  z <- pmin(z, max(cum.depth)) # don't alow depth to be greater than max depth
+  box.numlayers <- rep(0, length(z)) # vector containing number of water layers
+  for (i in 1: length(z)) {
+    box.numlayers[i] <- sum(z[i] > cum.depth)
+  }
+  box.data$numlayers <- box.numlayers # add the vector to box.data
+  
+  return(list(
+    map.vertices = map.vertices, 
+    box.data     = box.data)
+  )
+}
+
+bgm.file  <- "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Model development files/prior_HP documents/Data/Cover/gbr_geo_03012012.bgm"
+cum.depth <- c(0,5,10,20,50,100,200,2528) # these numbers are wrong
+map.object <- make.map.object.frc(bgm.file, cum.depth) 
+
+map.vertices <- map.object$map.vertices
+box.data <- map.object$box.data
+rm(map.object)
+
+ggplot(data = map.vertices, 
+  aes(x = x, y = y, group = boxid)) +
+  geom_polygon(colour = "black", fill = "grey95", size = 0.25, na.rm = TRUE) +
+  # geom_point(data = df.cover, aes(x = LONGITUDE, y = LATITUDE), 
+  #   size = 0.5, color = "tomato", inherit.aes = FALSE) +
+  geom_point(data = df.AIMS, aes(x = LONGITUDE, y = LATITUDE),
+             size = 1.5, color = "tomato", inherit.aes = FALSE)+
+  xlab("Longitude") + ylab("Latitude") +
+  ggplot2::theme_bw()
+```
+
+## Cover
+
+Twelve benthic types, including reef and flat, were detected.
+
+```{r fig.height = 17, fig.width=10}
+
+df.plot <- tidyr::gather(
+  data = dplyr::select(df.AIMS, LATITUDE, LONGITUDE, AlgaeCC:Reef),
+  key = Group, value = Cover, AlgaeCC:Reef) %>%
+  arrange(Group, Cover)
+df.plot <- df.plot[complete.cases(df.plot), ]
+
+ggplot(data = filter(df.plot, Cover > 0), 
+  aes(x = LONGITUDE, y = LATITUDE, color = Cover)) +
+  scale_colour_gradient(low="blue", high="red") +
+  geom_polygon(data = map.vertices, 
+    aes(x = x, y = y, group = boxid), 
+    colour = "black", fill = "grey95", size = 0.5, 
+    na.rm = TRUE, inherit.aes = FALSE) +
+  geom_point(size = 2) +
+  labs(color = "Proportional cover") +
+  facet_wrap( ~ Group, ncol = 3) +
+  xlab("Longitude") + ylab("Latitude") +
+  ggplot2::theme_bw()
+```
+
+## Habitats
+
+The distribution of the two habitat types throughout the GBR is shown below. Habitats and the rationale behind them for this dataset are calculated in the script "AIMS_Benthic_Analysis.Rmd". The values of "flat" correspond to the % cover of sand. Reef is calculated as the sum of all biotic groups and hard abiotic substrate, including rock and rubble.
+
+```{r fig.height = 6, fig.width=10}
+
+df.plot <- tidyr::gather(data = dplyr::select(df.AIMS, REEF_NAME, SITE_NO, LATITUDE, LONGITUDE,
+                                       AlgaeCC:Reef),
+                         key = Abiotic, value = AbioticCover, Flat:Reef)
+df.plot <- tidyr::gather(data = df.plot, 
+                         key = Type, value = BioticCover, AlgaeCC:HardCoral)
+
+ggplot(data = df.plot, 
+  aes(x = LONGITUDE, y = LATITUDE, color = AbioticCover)) +
+  geom_polygon(data = map.vertices, 
+    aes(x = x, y = y, group = boxid), 
+    colour = "black", fill = "grey95", size = 0.25, 
+    na.rm = TRUE, inherit.aes = FALSE) +
+  scale_y_continuous(breaks=-10:-25) + 
+  scale_color_gradient(low="blue", high="red", na.value = "red") +
+  geom_point(size = 1.5) +
+  labs(color = "Fraction\ncover") +
+  facet_wrap( ~ Abiotic) +
+  xlab("Longitude") + ylab("Latitude") +
+  scale_x_continuous(breaks=c(140,143,146,149,152,155)) + 
+  ggplot2::theme_bw()
+```
+
+
+## Ternary relationships
+
+```{r fig.height = 4}
+df.plot <- dplyr::select(df.AIMS, LATITUDE, HardCoral, Macroalgae, Sponges)
+
+ggtern(data=df.plot, aes(x = HardCoral, y = Macroalgae, z = Sponges, color = LATITUDE)) +
+  geom_point() +
+  labs(color = "Latitude") +
+  theme_arrownormal()+
+  theme_showarrows()+
+  scale_color_gradient(low="blue", high="red", na.value = "black") +
+  theme_bw()
+```
+
+Most sites have a high hard coral cover, with the ratio HC/SP and HC/MA sometimes being close to 100% for coral. Of these three benthic types, hard corals seem to be the dominant across the GBR. This was in 2005-2006.
+
+### How well do latitude and longitude predict habitat cover?
+
+```{r fig.height = 8, fig.width=10}
+
+df.plot <- tidyr::gather(
+  data = dplyr::select(df.AIMS, LATITUDE, LONGITUDE, AlgaeCC:Reef),
+  key = Group, value = Cover, AlgaeCC:Reef) %>%
+  arrange(Group, Cover)
+df.plot <- df.plot[complete.cases(df.plot), ]
+
+ggplot(data = df.plot, aes(x = LATITUDE, y = Cover)) +
+  geom_point(alpha = 0.5) +
+  xlab("Latitude") + ylab("Percent cover") +
+  facet_wrap(~ Group, nrow = 4) +
+  ggplot2::theme_bw()
+```
+
+Most benthic types do not show clear spatial patterns over latitudinal gradients, except for branching corals that are visibly more abundant in southerly reefs.
+
+```{r fig.height = 8, fig.width=10}
+
+ggplot(data = df.plot, aes(x = LONGITUDE, y = Cover)) +
+  geom_point(alpha = 0.5) +
+  xlab("Longitude") + ylab("Percent cover") +
+  facet_wrap(~ Group, nrow = 4) +
+  ggplot2::theme_bw()
+
+```
+
+Because the coastline is not on a perfect N-S axis, relationships with longitude are difficult to interpret. Two trends appear: branching corals are more abundant on easterly reefs, macroalgae on westerly reefs. For branching corals this may simply depend on the fact that they are more abundant on southerly reefs, which are also the easternmost ones. Macroalgae instead did not show a latitudinal trend, so the plot above might indicate there is overall a larger macroalgal cover on inner reefs (check in the literature).
+
+# Atlantis data
+
+Here the empirical data is translated to box data, which is used as input to Atlantis.
+
+Not doing habitat here as the AIMS data set is not suitable for that.
+
+```{r fig.height = 15, fig.width=10}
+
+numboxes <- max(map.vertices$boxid)
+
+df.AIMS$boxid <- rep(NA, dim(df.AIMS)[1])
+for (i in 0:numboxes) {
+  tmp <- filter(map.vertices, boxid == i)
+  bnd <- matrix(data = c(tmp$x, tmp$y), ncol = 2)
+  sites <- matrix(data = c(df.AIMS$LONGITUDE, df.AIMS$LATITUDE), ncol = 2)
+  df.AIMS$boxid[in.out(bnd,sites)] <- i
+}
+
+# Myrmidon reef falls into boundary box 43, as it is very close to the main reefline we force it into box 53
+
+df.AIMS[df.AIMS$boxid == 43,]$boxid <- 53
+
+df.summary <- df.AIMS %>% 
+  dplyr::select(REEF_NAME, AlgaeCC:boxid) %>%
+  group_by(boxid) %>%
+  summarise(
+    n = n(), 
+    mean.AlgaeCC = mean(AlgaeCC),
+    mean.AlgaeTurf = mean(AlgaeTurf),
+    mean.CoralBrain = mean(CoralBrain),
+    mean.CoralBranch = mean(CoralBranch),
+    mean.CoralSheet = mean(CoralSheet),
+    mean.CoralSoft = mean(CoralSoft),
+    mean.Macroalgae = mean(Macroalgae),
+    mean.Sponges = mean(Sponges),
+    mean.HardCoral = mean(HardCoral)
+  ) 
+
+box.data$boxid.old <- box.data$boxid
+box.data$boxid <- as.character(box.data$boxid.old)
+box.data$boxid <- as.integer(box.data$boxid)
+
+df.summary <- left_join(df.summary, dplyr::select(box.data, boxid, z), by = "boxid")
+df.summary$z <- -df.summary$z
+
+df.map <- left_join(map.vertices, df.summary, by = "boxid")
+df.map <- tidyr::gather(
+  data = df.map,
+  key = habitat, 
+  value = cover, 
+  mean.AlgaeCC:mean.HardCoral) 
+df.map$n[is.na(df.map$n)] <- 0
+
+df.map$cover[df.map$n < 3] <- NA
+
+ggplot(data = df.map, aes(x = x, y = y)) +
+  geom_polygon(aes(fill = cover, group = boxid), color = "black", size = 0.25) +
+    facet_wrap( ~ habitat, ncol = 3) +
+  scale_fill_gradient(low="blue", high="red", na.value = "white") +
+  scale_x_continuous(breaks=c(140,143,146,149,152,155)) + 
+  labs(fill = "Percent\ncover") +
+  xlab("Longitude") + ylab("Latitude") +
+  ggplot2::theme_bw()
+```
+
+The above shows that turf algae are the dominant benthic group on the Great Barrier Reef. I think that what is meant here by turf is smothering filamentous algae, instead of something that helps coral recruitment. Sponges appear to be more abundant on outer reefs compared to inner reefs, and they are more abundant on southerly reefs. Macroalgae are more abundant on inner reefs.
+
+In terms of functional types, hard corals and turf algae are the most abundant benthic types on the GBR. Soft corals are far more abundant than sponges too.
+
+There are some major difference between this dataset and the Seabed dataset in terms of percent cover of the benthic types. AIMS dataset can be considered better for calibration of reef polygons. However, seabed dataset has higher replication, and samples the GBR much more uniformly. The difference in the sampling methods will require caution in interpolating these two datasets.
+
+This data will have to be integrated to the Seabed data to better capture coral cover on reef polygons. The definition of reef polygon will be difficult because the AIMS data focuses on reefs only and should not be used to infer abiotic habitat cover (see above), whereas the seabed data (that does a good job at assessing habitat) avoids reefs.

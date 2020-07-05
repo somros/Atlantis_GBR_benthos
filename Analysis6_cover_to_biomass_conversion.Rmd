@@ -1,0 +1,175 @@
+---
+title: "Coversion % cover to biomass"
+author: "Alberto Rovellini"
+date: "July 26, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This document takes as input:
+
+* estCoverAIMS_andSBP_3sponges.csv (output of Analysis5)
+* conversionFactors.csv (see word document Proportion_trophic_types for assumptions and sources behind those)
+* GBRGroups_scratch.csv
+* The box dataset dataBoxes.csv
+* The box dataset with areas in square meters areaMeters.csv
+
+The goal is to use the existing cover data (from Seabed Biodiversity Project and from AIMS Long Term coral reef monitoring) and turn them into biomass estimates for each box.
+Some groups (e.g. Tridacna, Pearl oysters etc) are not covered by one (or either) dataset. Leave initial configuration for those ones, and get back to them if they misbehave in the simulations.
+Do not touch mangroves either. Seagrass uses conversion equation from Baird et al. (2016).
+
+```{r readData, message=FALSE, warning=FALSE}
+
+library(dplyr)
+library(reshape2)
+
+cover.data <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/GRBCoverParamEstAIMS_and_SBP/estCoverAIMS_andSBP_3sponges.csv")
+
+conversion.factor <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/conversionFactors.csv")
+
+groups <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/GBRGroups_scratch_Sponge_Code.csv")
+
+box.data <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/dataBoxes.csv")
+
+area.data <- read.csv("C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/areaMeters.csv")
+
+
+are.cover <- groups[groups$IsCover == 1,]$Name # this is the original not including 3 groups of sponges
+
+glimpse(cover.data)
+
+glimpse(conversion.factor)
+
+glimpse(box.data)
+
+```
+
+```{r}
+
+# get rid of abiotic columns in cover
+
+cover.data <- cover.data %>% dplyr::select(
+  AlgaeCC:SpongeBioeroding
+)
+
+# figure out for what groups in Atlantis GBR we have no cover data from the two AIMS + SBP datasets combined
+
+no.data <- rep(NA, length(are.cover))
+
+for (i in 1:length(are.cover)) {
+  if (!are.cover[i] %in% names(cover.data)) {
+    no.data[i] <- as.character(are.cover[i])
+  }
+}
+
+no.data <- no.data[!is.na(no.data)]
+
+# no.data <- no.data[-4]
+
+# there is no data for the following groups:
+
+no.data
+
+# drop these groups from conversion.factor
+
+for (i in 1:length(conversion.factor)) {
+  if (names(conversion.factor)[i] %in% no.data) {
+    conversion.factor[i] <- NA
+  }
+}
+
+conv.final <- conversion.factor[!is.na(conversion.factor)]
+
+```
+
+```{r}
+
+# We need the total area of each box. Because the proportional cover of each benthic type has already been scaled by the fracton of each box that is reef and the proportion that is not, we basically have the proportion of each box that is covered by each group. Multiply that by box area and you obtain the area covered by that group in the box. Multiply that by the biomass and we have the total biomass in that box in g N m-2
+
+# turns out we did not need the area at all, my bad. correct this
+
+# leave out seagrass and do that later as that is done differently
+
+cover.data.nSG <- cover.data[,-9]
+
+box.data$area.meters <- area.data[,1]
+
+biomass.data <- as.data.frame(matrix(0, nrow = nrow(cover.data.nSG), ncol = ncol(cover.data.nSG)))
+
+
+for (j in 1:ncol(biomass.data)) {
+  for (i in 1:nrow(biomass.data)) {
+  biomass.data[i,j] <- cover.data.nSG[i,j] * conv.final[j]
+  }
+}
+
+names(biomass.data) <- names(cover.data.nSG)
+
+# need to do seagrass now
+# from Baird et al. (2016) Aeff = 1 - exp(-omega * B *correction factor) see Fig. 11
+# Thus B = -log(1 - Aeff) / (omega * corr)
+
+cover.data.SG <- cover.data[,9]
+
+omega <- 2 # unit is m2 g N-1
+
+corr.SG <- 0.0192 # unit is g N g DW-1
+
+biomass.SG <- -(log(1 - cover.data.SG) / (omega * corr.SG)) * 1000 # 1000 needed to convert from g N to mg N
+
+# at high cover it tends to pile up and biomass grow exponentially
+
+# now bring them together
+
+df.biomass <- cbind(biomass.data, biomass.SG)
+
+names(df.biomass)[length(df.biomass)] <- "Seagrass"
+
+
+```
+
+Now we need to divide by cohorts for those groups that have cohorts. Assume age structure is the one of equal size bins (we can work on that). Need to do only for biomass.
+
+```{r}
+
+# number of cohorts for each benthic group
+
+groups.benthic <- groups[groups$IsCover == 1,] %>% dplyr::select(
+  Name, NumCohorts
+)
+
+gb <- groups.benthic[!groups.benthic$Name %in% no.data,]
+
+glimpse(gb)
+
+biomass.cohorts <-df.biomass %>% mutate(
+  CoralBrain_N1 = CoralBrain / gb[gb$Name == "CoralBrain", 2],
+  CoralBrain_N2 = CoralBrain / gb[gb$Name == "CoralBrain", 2],
+  CoralBrain_N3 = CoralBrain / gb[gb$Name == "CoralBrain", 2],
+  CoralSheet_N1 = CoralSheet / gb[gb$Name == "CoralSheet", 2],
+  CoralSheet_N2 = CoralSheet / gb[gb$Name == "CoralSheet", 2],
+  CoralBranch_N1 = CoralBranch / gb[gb$Name == "CoralBranch", 2],
+  CoralBranch_N2 = CoralBranch / gb[gb$Name == "CoralBranch", 2],
+  SpongeHeterotrophic_N1 = SpongeHeterotrophic / gb[gb$Name == "SpongeHeterotrophic", 2],
+  SpongeHeterotrophic_N2 = SpongeHeterotrophic / gb[gb$Name == "SpongeHeterotrophic", 2],
+  SpongePhototrophic_N1 = SpongePhototrophic / gb[gb$Name == "SpongePhototrophic", 2],
+  SpongePhototrophic_N2 = SpongePhototrophic / gb[gb$Name == "SpongePhototrophic", 2],
+  SpongeBioeroding_N1 = SpongeBioeroding / gb[gb$Name == "SpongeBioeroding", 2],
+  SpongeBioeroding_N2 = SpongeBioeroding / gb[gb$Name == "SpongeBioeroding", 2],
+  Seagrass_N1 = Seagrass / gb[gb$Name == "Seagrass", 2],
+  Seagrass_N2 = Seagrass / gb[gb$Name == "Seagrass", 2],
+  Seagrass_N3 = Seagrass / gb[gb$Name == "Seagrass", 2]
+) %>% dplyr::select(
+  AlgaeCC,AlgaeTurf,CoralSoft:OtherBivalves,CoralBrain_N1:Seagrass_N3
+)
+
+biomass.cohorts[is.na(biomass.cohorts)] <- 0
+
+
+write.csv(biomass.cohorts, file = "C:/Users/arove/Documents/Projects/Chapter3/Atlantis_resources/Data/AIMS_benthic_monitoring/GRBCoverParamEstAIMS_and_SBP/estBiomassAIMS_andSBP_3sponges.csv", row.names = FALSE)
+
+```
+
